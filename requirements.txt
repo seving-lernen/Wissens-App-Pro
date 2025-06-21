@@ -1,2 +1,9 @@
 Flask
 gunicorn
+python-dotenv
+supabase
+langchain
+langchain-community
+langchain_google_genai
+PyMuPDF
+faiss-cpu
