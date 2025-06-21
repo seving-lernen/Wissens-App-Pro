@@ -1,4 +1,4 @@
-# WISSENS-APP PRO - VERSION 3.0 (SUPABASE CLOUD-SPEICHER)
+# WISSENS-APP PRO - FINALE VERSION 3.1
 import os
 import uuid
 import shutil
@@ -18,12 +18,17 @@ import random
 load_dotenv()
 app = Flask(__name__)
 
-# Lade Supabase-Zugangsdaten aus den Umgebungsvariablen
+# Intelligenter PFAD-BLOCK für Render und lokale Entwicklung
+if os.environ.get('RENDER'):
+    DATA_PATH = '/var/data'
+else:
+    DATA_PATH = '.'
+
+# Supabase Konfiguration
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-BUCKET_NAME = "wissens-daten" # Der Name deines Buckets auf Supabase
+BUCKET_NAME = "wissens-daten"
 
 # KI-Komponenten laden
 try:
@@ -34,31 +39,19 @@ except Exception as e:
 
 # --- Hilfsfunktionen ---
 def load_vector_store_from_supabase(library_id):
-    """Lädt einen FAISS-Index aus Supabase Storage herunter und lokal."""
     try:
-        # Pfad in Supabase und lokaler temporärer Pfad
-        supabase_path = f"{library_id}/faiss_index.pkl"
+        supabase_path_pkl = f"{library_id}/faiss_index.pkl"
+        supabase_path_faiss = f"{library_id}/faiss_index.faiss"
         local_temp_path = f"temp_index_{library_id}"
         
-        # Lade die Index-Datei herunter
         with open(f"{local_temp_path}.pkl", 'wb+') as f:
-            res = supabase.storage.from_(BUCKET_NAME).download(supabase_path)
-            f.write(res)
-        
-        # FAISS benötigt auch eine .faiss Datei, die wir ebenfalls herunterladen
+            f.write(supabase.storage.from_(BUCKET_NAME).download(supabase_path_pkl))
         with open(f"{local_temp_path}.faiss", 'wb+') as f:
-            res = supabase.storage.from_(BUCKET_NAME).download(f"{library_id}/faiss_index.faiss")
-            f.write(res)
-
-        print(f"--> Index für '{library_id}' von Supabase heruntergeladen.")
+            f.write(supabase.storage.from_(BUCKET_NAME).download(supabase_path_faiss))
         
-        # Lade den Index vom lokalen temporären Pfad
         vectorstore = FAISS.load_local(local_temp_path, embeddings, allow_dangerous_deserialization=True)
-        
-        # Temporäre Dateien aufräumen
         os.remove(f"{local_temp_path}.pkl")
         os.remove(f"{local_temp_path}.faiss")
-        
         return vectorstore
     except Exception as e:
         print(f"Fehler beim Laden des Index für {library_id}: {e}")
@@ -70,82 +63,163 @@ def admin_page():
     if request.method == 'POST':
         files = request.files.getlist('files')
         if not files or files[0].filename == '': return "Keine Dateien ausgewählt", 400
-
         library_id = str(uuid.uuid4())
-        print(f"Erstelle neue Bibliothek mit ID: {library_id}")
-
-        # Verarbeite die PDFs direkt im Speicher
+        
         docs = []
         for file in files:
-            # Lade PDF-Daten in den Speicher
             pdf_bytes = file.read()
-            # Lade aus Bytes (erfordert PyMuPDF)
-            # Hierzu erstellen wir eine temporäre Datei, da PyMuPDFLoader einen Pfad erwartet
             temp_file_path = f"temp_{file.filename}"
             with open(temp_file_path, 'wb') as f:
                 f.write(pdf_bytes)
             
-            # Lade die PDF mit LangChain
             loader = PyMuPDFLoader(temp_file_path)
             docs.extend(loader.load())
             
-            # Lade PDF-Datei nach Supabase hoch
-            supabase.storage.from_(BUCKET_NAME).upload(file=pdf_bytes, path=f"{library_id}/{file.filename}")
-            print(f"--> PDF '{file.filename}' nach Supabase hochgeladen.")
-
-            # Lösche temporäre Datei
+            # Reset file pointer before uploading to Supabase
+            file.seek(0)
+            supabase.storage.from_(BUCKET_NAME).upload(file=file, path=f"{library_id}/{file.filename}", file_options={"content-type": "application/pdf"})
             os.remove(temp_file_path)
 
-        # Erstelle Vektor-Store
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
         split_docs = text_splitter.split_documents(docs)
         vectorstore = FAISS.from_documents(split_docs, embeddings)
         
-        # Speichere Index temporär lokal, um ihn dann hochzuladen
         temp_index_path = f"temp_index_{library_id}"
         vectorstore.save_local(temp_index_path)
 
-        # Lade die beiden Index-Dateien nach Supabase hoch
         with open(f"{temp_index_path}.pkl", 'rb') as f:
             supabase.storage.from_(BUCKET_NAME).upload(file=f, path=f"{library_id}/faiss_index.pkl")
         with open(f"{temp_index_path}.faiss", 'rb') as f:
             supabase.storage.from_(BUCKET_NAME).upload(file=f, path=f"{library_id}/faiss_index.faiss")
         
-        print(f"--> FAISS Index für '{library_id}' nach Supabase hochgeladen.")
-
-        # Lösche temporäre Index-Dateien
         os.remove(f"{temp_index_path}.pkl")
         os.remove(f"{temp_index_path}.faiss")
         
         return redirect(url_for('creation_success', library_id=library_id))
 
-    # Zeige alle existierenden Bibliotheken an (indem wir die "Ordner" in Supabase auflisten)
     res = supabase.storage.from_(BUCKET_NAME).list()
     existing_libraries = [item['name'] for item in res if item['id'] is not None]
-    return render_template_string(ADMIN_HTML, libraries=existing_libraries)
+    return render_template_string(ADMIN_HTML, libraries=existing_libraries, request=request)
 
-# Die anderen Routen (/success, /learn, /ask, /evaluate) bleiben fast identisch,
-# sie müssen nur `load_vector_store_from_supabase` statt `load_vector_store` aufrufen.
-# Der restliche HTML-Code bleibt ebenfalls identisch.
-# (Aus Kürze hier weggelassen, aber im Kopf behalten)
+@app.route('/success/<library_id>')
+def creation_success(library_id):
+    learn_url = request.host_url.replace('http://', 'https://') + f'learn/{library_id}'
+    return render_template_string(SUCCESS_HTML, learn_url=learn_url)
 
-# Hier ist ein Beispiel für die angepasste /ask Route:
+@app.route('/learn/<library_id>')
+def learn_page(library_id):
+    return render_template_string(LERNER_HTML, library_id=library_id)
+
 @app.route('/ask', methods=['POST'])
 def ask_question():
     try:
         library_id = request.json.get('library_id')
-        vectorstore = load_vector_store_from_supabase(library_id) # ANGEPASSTER AUFRUF
+        vectorstore = load_vector_store_from_supabase(library_id)
         if not vectorstore: return jsonify({"error": "Bibliothek konnte nicht geladen werden."}), 404
-        #... rest der Funktion bleibt gleich ...
+        if not vectorstore.docstore._dict: return jsonify({"error": "Diese Bibliothek enthält keine Dokumente."}), 500
         random_doc_index = random.choice(list(vectorstore.docstore._dict.keys()))
         context_text = vectorstore.docstore._dict[random_doc_index].page_content
-        prompt_template = "Du bist ein Lehrer... Frage:"
+        prompt_template = "Du bist ein Lehrer. Erstelle eine prägnante Frage zum folgenden Textabschnitt... Frage:"
         prompt = PromptTemplate.from_template(prompt_template)
         chain = prompt | llm
         question = chain.invoke({"context": context_text}).content
         return jsonify({"question": question.strip()})
     except Exception as e:
-        # ... fehlerbehandlung bleibt gleich
-        return jsonify({"error": f"Server-Fehler: {str(e)}"}), 500
-        
-# Hier müsste der restliche Code (andere Routen, HTML) aus der letzten Version folgen.
+        traceback.print_exc()
+        return jsonify({"error": f"Server-Fehler in /ask: {str(e)}"}), 500
+
+@app.route('/evaluate', methods=['POST'])
+def evaluate_answer():
+    try:
+        data = request.json
+        library_id, question, participant_answer = data.get('library_id'), data.get('question'), data.get('answer')
+        vectorstore = load_vector_store_from_supabase(library_id)
+        if not vectorstore: return jsonify({"error": "Bibliothek konnte nicht geladen werden."}), 404
+        retriever = vectorstore.as_retriever(search_kwargs={'k': 3})
+        relevant_docs = retriever.get_relevant_documents(question + " " + participant_answer)
+        context_from_docs = "\n\n".join([doc.page_content for doc in relevant_docs])
+        evaluation_template = """Bewerte als strenger Prüfer... Bewertung und Begründung:"""
+        prompt = PromptTemplate.from_template(evaluation_template)
+        chain = prompt | llm
+        evaluation_result = chain.invoke({"context": context_from_docs, "question": question, "answer": participant_answer}).content
+        return jsonify({"evaluation": evaluation_result})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"Server-Fehler in /evaluate: {str(e)}"}), 500
+
+ADMIN_HTML = """
+<!DOCTYPE html><html lang="de"><head><title>Admin: Wissensbibliotheken</title>
+<style>body{font-family:sans-serif;max-width:800px;margin:auto;padding:20px;background:#f0f8ff} h1,h2{color:#005a9c} a{color:#007bff} ul{list-style-type:none;padding:0} li{background:#fff;margin-bottom:10px;padding:15px;border-radius:5px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}</style>
+</head><body>
+<h1>Admin-Bereich</h1><h2>Neue Bibliothek erstellen</h2>
+<form method="post" enctype="multipart/form-data"><p>Wählen Sie die PDFs aus, um eine neue, permanente Bibliothek zu erstellen:</p><input type="file" name="files" multiple required><button type="submit">Bibliothek erstellen</button></form><hr>
+<h2>Bestehende Bibliotheken</h2>
+{% if libraries %}<ul>{% for lib_id in libraries %}<li><strong>Bibliothek-ID:</strong> {{ lib_id }}<br><strong>Lern-Link:</strong> <a href="/learn/{{ lib_id }}" target="_blank">{{ request.host_url.replace('http://', 'https://') }}learn/{{ lib_id }}</a></li>{% endfor %}</ul>
+{% else %}<p>Noch keine Bibliotheken erstellt.</p>{% endif %}
+</body></html>
+"""
+SUCCESS_HTML = """
+<!DOCTYPE html><html lang="de"><head><title>Erfolg!</title>
+<style>body{font-family:sans-serif;text-align:center;padding-top:50px} div{background:#e0ffe0;border:1px solid green;padding:30px;max-width:700px;margin:auto;border-radius:10px}</style>
+</head><body>
+<div><h1>Bibliothek erfolgreich erstellt!</h1><p>Teilen Sie diesen permanenten Link mit Ihren Teilnehmern:</p><a href="{{ learn_url }}">{{ learn_url }}</a><br><br><a href="/">Zurück zur Admin-Seite</a></div>
+</body></html>
+"""
+LERNER_HTML = """
+<!DOCTYPE html><html lang="de"><head><title>Lern-Modul</title>
+<style>body{font-family:sans-serif;max-width:600px;margin:auto;padding:20px;background-color:#f4f7f6}#qa-area{display:none;margin-top:20px}#question{font-weight:bold;margin-bottom:10px;font-size:1.1em}#evaluation{margin-top:20px;padding:15px;border:1px solid #ccc;background:#fff;white-space:pre-wrap;border-radius:5px}button{background-color:#28a745;color:white;padding:10px 15px;border:none;border-radius:5px;cursor:pointer}button:hover{background-color:#218838}button:disabled{background-color:#6c757d}</style>
+</head><body><h1>Lernen mit KI</h1><button id="get-question-btn">Neue Frage anfordern</button><div id="qa-area"><p id="question"></p><textarea id="answer" rows="4" style="width:100%;" placeholder="Ihre Antwort hier..."></textarea><button id="submit-answer-btn">Antwort abschicken</button></div><div id="evaluation" style="display:none;"></div>
+<script>
+    const libraryId = '{{ library_id }}';
+    const getQuestionBtn = document.getElementById('get-question-btn');
+    const submitAnswerBtn = document.getElementById('submit-answer-btn');
+    const qaArea = document.getElementById('qa-area');
+    const questionEl = document.getElementById('question');
+    const answerEl = document.getElementById('answer');
+    const evaluationEl = document.getElementById('evaluation');
+    async function getQuestion() {
+        getQuestionBtn.disabled = true;
+        getQuestionBtn.textContent = 'Generiere Frage...';
+        const response = await fetch('/ask', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ library_id: libraryId })});
+        const data = await response.json();
+        if (response.ok) {
+            questionEl.textContent = data.question;
+            qaArea.style.display = 'block';
+            evaluationEl.style.display = 'none';
+            getQuestionBtn.style.display = 'none';
+        } else {
+            alert('Fehler beim Fragen holen: ' + data.error);
+            getQuestionBtn.disabled = false;
+            getQuestionBtn.textContent = 'Neue Frage anfordern';
+        }
+    }
+    async function evaluateAnswer() {
+        const question = questionEl.textContent;
+        const answer = answerEl.value;
+        if (!answer.trim()) { alert('Bitte geben Sie eine Antwort ein.'); return; }
+        submitAnswerBtn.disabled = true;
+        submitAnswerBtn.textContent = 'Bewerte...';
+        const response = await fetch('/evaluate', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ library_id: libraryId, question: question, answer: answer })});
+        const data = await response.json();
+        submitAnswerBtn.disabled = false;
+        submitAnswerBtn.textContent = 'Antwort abschicken';
+        if (response.ok) {
+            evaluationEl.innerText = data.evaluation;
+            evaluationEl.style.display = 'block';
+            qaArea.style.display = 'none';
+            getQuestionBtn.style.display = 'block';
+            getQuestionBtn.disabled = false;
+            getQuestionBtn.textContent = 'Nächste Frage anfordern';
+            answerEl.value = '';
+        } else {
+            alert('Fehler bei der Bewertung: ' + data.error);
+        }
+    }
+    getQuestionBtn.addEventListener('click', getQuestion);
+    submitAnswerBtn.addEventListener('click', evaluateAnswer);
+</script>
+</body></html>
+"""
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5001)
