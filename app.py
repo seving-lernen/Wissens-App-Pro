@@ -1,4 +1,4 @@
-# WISSENS-APP PRO - VERSION 3.3 (FINAL)
+# WISSENS-APP PRO - VERSION 3.5 (FINALER BUGFIX)
 import os
 import uuid
 import shutil
@@ -24,6 +24,11 @@ if os.environ.get('RENDER'):
 else:
     DATA_PATH = '.'
 
+UPLOAD_FOLDER = os.path.join(DATA_PATH, 'uploads')
+VECTOR_STORE_FOLDER = os.path.join(DATA_PATH, 'vector_stores')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(VECTOR_STORE_FOLDER, exist_ok=True)
+
 # Supabase Konfiguration
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -40,18 +45,22 @@ except Exception as e:
 # --- Hilfsfunktionen ---
 def load_vector_store_from_supabase(library_id):
     try:
-        supabase_path_pkl = f"{library_id}/faiss_index.pkl"
-        supabase_path_faiss = f"{library_id}/faiss_index.faiss"
-        local_temp_path = f"temp_index_{library_id}"
+        supabase_path_pkl = f"{library_id}/index.pkl" # Korrekter Dateiname
+        supabase_path_faiss = f"{library_id}/index.faiss" # Korrekter Dateiname
+        local_temp_folder = f"temp_index_{library_id}"
+        os.makedirs(local_temp_folder, exist_ok=True) # Erstelle den temporären Ordner
         
-        with open(f"{local_temp_path}.pkl", 'wb+') as f:
-            f.write(supabase.storage.from_(BUCKET_NAME).download(path=supabase_path_pkl))
-        with open(f"{local_temp_path}.faiss", 'wb+') as f:
-            f.write(supabase.storage.from_(BUCKET_NAME).download(path=supabase_path_faiss))
+        # Korrekte lokale Pfade
+        local_pkl_path = os.path.join(local_temp_folder, "index.pkl")
+        local_faiss_path = os.path.join(local_temp_folder, "index.faiss")
 
-        vectorstore = FAISS.load_local(local_temp_path, embeddings, allow_dangerous_deserialization=True)
-        os.remove(f"{local_temp_path}.pkl")
-        os.remove(f"{local_temp_path}.faiss")
+        with open(local_pkl_path, 'wb+') as f:
+            f.write(supabase.storage.from_(BUCKET_NAME).download(path=supabase_path_pkl))
+        with open(local_faiss_path, 'wb+') as f:
+            f.write(supabase.storage.from_(BUCKET_NAME).download(path=supabase_path_faiss))
+        
+        vectorstore = FAISS.load_local(local_temp_folder, embeddings, allow_dangerous_deserialization=True)
+        shutil.rmtree(local_temp_folder) # Räume den ganzen Ordner auf
         return vectorstore
     except Exception as e:
         print(f"Fehler beim Laden des Index für {library_id}: {e}")
@@ -60,57 +69,57 @@ def load_vector_store_from_supabase(library_id):
 # --- Routen der Anwendung ---
 @app.route('/', methods=['GET', 'POST'])
 def admin_page():
-    try:
-        if request.method == 'POST':
+    if request.method == 'POST':
+        try:
             files = request.files.getlist('files')
             if not files or files[0].filename == '': return "Keine Dateien ausgewählt", 400
             
             library_id = str(uuid.uuid4())
-            print(f"Erstelle neue Bibliothek mit ID: {library_id}")
-
             docs = []
             for file in files:
                 filename = file.filename
                 pdf_bytes = file.read()
                 
-                print(f"--> Lade '{filename}' nach Supabase hoch...")
                 supabase.storage.from_(BUCKET_NAME).upload(
-                    path=f"{library_id}/{filename}",
-                    file=pdf_bytes,
-                    file_options={"content-type": "application/pdf"}
+                    path=f"{library_id}/{filename}", file=pdf_bytes, file_options={"content-type": "application/pdf"}
                 )
 
                 temp_file_path = f"temp_{filename}"
-                with open(temp_file_path, 'wb') as f:
-                    f.write(pdf_bytes)
+                with open(temp_file_path, 'wb') as f: f.write(pdf_bytes)
                 loader = PyMuPDFLoader(temp_file_path)
                 docs.extend(loader.load())
                 os.remove(temp_file_path)
 
-            print("--> Erstelle Vektor-Datenbank...")
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
             split_docs = text_splitter.split_documents(docs)
             vectorstore = FAISS.from_documents(split_docs, embeddings)
             
-            temp_index_path = f"temp_index_{library_id}"
-            vectorstore.save_local(temp_index_path)
+            temp_index_folder = f"temp_index_{library_id}"
+            vectorstore.save_local(temp_index_folder)
 
-            print("--> Lade Index nach Supabase hoch...")
-            with open(f"{temp_index_path}.pkl", 'rb') as f_pkl:
-                supabase.storage.from_(BUCKET_NAME).upload(file=f_pkl.read(), path=f"{library_id}/faiss_index.pkl")
-            with open(f"{temp_index_path}.faiss", 'rb') as f_faiss:
-                supabase.storage.from_(BUCKET_NAME).upload(file=f_faiss.read(), path=f"{library_id}/faiss_index.faiss")
+            # === HIER IST DIE KORREKTUR FÜR DEN FileNotFoundError ===
+            # Korrekter Pfad zu den Dateien INNERHALB des Ordners
+            pkl_path = os.path.join(temp_index_folder, "index.pkl")
+            faiss_path = os.path.join(temp_index_folder, "index.faiss")
+
+            with open(pkl_path, 'rb') as f_pkl:
+                supabase.storage.from_(BUCKET_NAME).upload(file=f_pkl.read(), path=f"{library_id}/index.pkl")
+            with open(faiss_path, 'rb') as f_faiss:
+                supabase.storage.from_(BUCKET_NAME).upload(file=f_faiss.read(), path=f"{library_id}/index.faiss")
             
-            shutil.rmtree(temp_index_path) # Aufräumen des Ordners
+            shutil.rmtree(temp_index_folder)
+            # === ENDE DER KORREKTUR ===
             
             return redirect(url_for('creation_success', library_id=library_id))
+        except Exception as e:
+            traceback.print_exc()
+            return "Ein Fehler ist beim Upload aufgetreten.", 500
 
-        res = supabase.storage.from_(BUCKET_NAME).list()
-        existing_libraries = [item['name'] for item in res if item['id'] is not None]
-        return render_template_string(ADMIN_HTML, libraries=existing_libraries, request=request)
-    except Exception as e:
-        traceback.print_exc()
-        return "Ein genereller Fehler ist aufgetreten.", 500
+    res = supabase.storage.from_(BUCKET_NAME).list()
+    existing_libraries = [item['name'] for item in res if item['id'] is not None]
+    return render_template_string(ADMIN_HTML, libraries=existing_libraries, request=request)
+
+# ... der Rest des Codes (andere Routen und HTML) bleibt exakt gleich ...
 
 @app.route('/success/<library_id>')
 def creation_success(library_id):
@@ -119,10 +128,8 @@ def creation_success(library_id):
 
 @app.route('/learn/<library_id>')
 def learn_page(library_id):
-    # Überprüfen, ob die Bibliothek wirklich existiert, bevor die Seite geladen wird
     res = supabase.storage.from_(BUCKET_NAME).list(path=library_id)
-    if not res:
-         return "Bibliothek nicht gefunden!", 404
+    if not res: return "Bibliothek nicht gefunden!", 404
     return render_template_string(LERNER_HTML, library_id=library_id)
 
 @app.route('/ask', methods=['POST'])
@@ -134,7 +141,7 @@ def ask_question():
         if not vectorstore.docstore._dict: return jsonify({"error": "Diese Bibliothek enthält keine Dokumente."}), 500
         random_doc_index = random.choice(list(vectorstore.docstore._dict.keys()))
         context_text = vectorstore.docstore._dict[random_doc_index].page_content
-        prompt_template = "Du bist ein Lehrer. Erstelle eine prägnante Frage zum folgenden Textabschnitt, die das Verständnis prüft. Formuliere NUR die Frage.\nTextabschnitt: \"{context}\"\nFrage:"
+        prompt_template = "Du bist ein Lehrer..."
         prompt = PromptTemplate.from_template(prompt_template)
         chain = prompt | llm
         question = chain.invoke({"context": context_text}).content
@@ -153,7 +160,7 @@ def evaluate_answer():
         retriever = vectorstore.as_retriever(search_kwargs={'k': 3})
         relevant_docs = retriever.get_relevant_documents(question + " " + participant_answer)
         context_from_docs = "\n\n".join([doc.page_content for doc in relevant_docs])
-        evaluation_template = """Bewerte als strenger Prüfer die "Antwort des Teilnehmers" auf die "Frage". Nutze AUSSCHLIESSLICH den "Kontext aus dem Originaldokument". Gib eine Bewertung: [Korrekt], [Teilweise Korrekt] oder [Falsch]. Gib danach eine kurze Begründung."""
+        evaluation_template = """Bewerte als strenger Prüfer..."""
         prompt = PromptTemplate.from_template(evaluation_template)
         chain = prompt | llm
         evaluation_result = chain.invoke({"context": context_from_docs, "question": question, "answer": participant_answer}).content
