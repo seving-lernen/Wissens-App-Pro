@@ -1,4 +1,4 @@
-# WISSENS-APP PRO - FINALE VERSION 3.1
+# WISSENS-APP PRO - VERSION 3.2 (FINAL)
 import os
 import uuid
 import shutil
@@ -18,12 +18,6 @@ import random
 load_dotenv()
 app = Flask(__name__)
 
-# Intelligenter PFAD-BLOCK für Render und lokale Entwicklung
-if os.environ.get('RENDER'):
-    DATA_PATH = '/var/data'
-else:
-    DATA_PATH = '.'
-
 # Supabase Konfiguration
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -40,18 +34,24 @@ except Exception as e:
 # --- Hilfsfunktionen ---
 def load_vector_store_from_supabase(library_id):
     try:
+        # Pfade definieren
         supabase_path_pkl = f"{library_id}/faiss_index.pkl"
         supabase_path_faiss = f"{library_id}/faiss_index.faiss"
         local_temp_path = f"temp_index_{library_id}"
         
+        # Index-Dateien von Supabase herunterladen und temporär speichern
         with open(f"{local_temp_path}.pkl", 'wb+') as f:
-            f.write(supabase.storage.from_(BUCKET_NAME).download(supabase_path_pkl))
+            f.write(supabase.storage.from_(BUCKET_NAME).download(path=supabase_path_pkl))
         with open(f"{local_temp_path}.faiss", 'wb+') as f:
-            f.write(supabase.storage.from_(BUCKET_NAME).download(supabase_path_faiss))
-        
+            f.write(supabase.storage.from_(BUCKET_NAME).download(path=supabase_path_faiss))
+
+        # Index von der lokalen temporären Datei laden
         vectorstore = FAISS.load_local(local_temp_path, embeddings, allow_dangerous_deserialization=True)
+        
+        # Temporäre Dateien sofort wieder aufräumen
         os.remove(f"{local_temp_path}.pkl")
         os.remove(f"{local_temp_path}.faiss")
+        
         return vectorstore
     except Exception as e:
         print(f"Fehler beim Laden des Index für {library_id}: {e}")
@@ -61,41 +61,58 @@ def load_vector_store_from_supabase(library_id):
 @app.route('/', methods=['GET', 'POST'])
 def admin_page():
     if request.method == 'POST':
-        files = request.files.getlist('files')
-        if not files or files[0].filename == '': return "Keine Dateien ausgewählt", 400
-        library_id = str(uuid.uuid4())
-        
-        docs = []
-        for file in files:
-            pdf_bytes = file.read()
-            temp_file_path = f"temp_{file.filename}"
-            with open(temp_file_path, 'wb') as f:
-                f.write(pdf_bytes)
+        try:
+            files = request.files.getlist('files')
+            if not files or files[0].filename == '': return "Keine Dateien ausgewählt", 400
             
-            loader = PyMuPDFLoader(temp_file_path)
-            docs.extend(loader.load())
+            library_id = str(uuid.uuid4())
+            print(f"Erstelle neue Bibliothek mit ID: {library_id}")
+
+            docs = []
+            for file in files:
+                filename = file.filename
+                pdf_bytes = file.read()
+                
+                # Lade PDF-Datei nach Supabase hoch
+                print(f"--> Lade '{filename}' nach Supabase hoch...")
+                # KORREKTUR: Wir übergeben die `pdf_bytes`, nicht das `file`-Objekt.
+                supabase.storage.from_(BUCKET_NAME).upload(
+                    path=f"{library_id}/{filename}",
+                    file=pdf_bytes,
+                    file_options={"content-type": "application/pdf"}
+                )
+
+                # Verarbeite die PDF für LangChain
+                temp_file_path = f"temp_{filename}"
+                with open(temp_file_path, 'wb') as f:
+                    f.write(pdf_bytes)
+                loader = PyMuPDFLoader(temp_file_path)
+                docs.extend(loader.load())
+                os.remove(temp_file_path)
+
+            print("--> Erstelle Vektor-Datenbank...")
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
+            split_docs = text_splitter.split_documents(docs)
+            vectorstore = FAISS.from_documents(split_docs, embeddings)
             
-            # Reset file pointer before uploading to Supabase
-            file.seek(0)
-            supabase.storage.from_(BUCKET_NAME).upload(file=file, path=f"{library_id}/{file.filename}", file_options={"content-type": "application/pdf"})
-            os.remove(temp_file_path)
+            # Speichere Index temporär lokal, um ihn dann hochzuladen
+            temp_index_path = f"temp_index_{library_id}"
+            vectorstore.save_local(temp_index_path)
 
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
-        split_docs = text_splitter.split_documents(docs)
-        vectorstore = FAISS.from_documents(split_docs, embeddings)
-        
-        temp_index_path = f"temp_index_{library_id}"
-        vectorstore.save_local(temp_index_path)
-
-        with open(f"{temp_index_path}.pkl", 'rb') as f:
-            supabase.storage.from_(BUCKET_NAME).upload(file=f, path=f"{library_id}/faiss_index.pkl")
-        with open(f"{temp_index_path}.faiss", 'rb') as f:
-            supabase.storage.from_(BUCKET_NAME).upload(file=f, path=f"{library_id}/faiss_index.faiss")
-        
-        os.remove(f"{temp_index_path}.pkl")
-        os.remove(f"{temp_index_path}.faiss")
-        
-        return redirect(url_for('creation_success', library_id=library_id))
+            print("--> Lade Index nach Supabase hoch...")
+            with open(f"{temp_index_path}.pkl", 'rb') as f:
+                supabase.storage.from_(BUCKET_NAME).upload(file=f, path=f"{library_id}/faiss_index.pkl")
+            with open(f"{temp_index_path}.faiss", 'rb') as f:
+                supabase.storage.from_(BUCKET_NAME).upload(file=f, path=f"{library_id}/faiss_index.faiss")
+            
+            os.remove(f"{temp_index_path}.pkl")
+            os.remove(f"{temp_index_path}.faiss")
+            print(f"--> Bibliothek '{library_id}' erfolgreich erstellt.")
+            
+            return redirect(url_for('creation_success', library_id=library_id))
+        except Exception as e:
+            traceback.print_exc()
+            return "Ein Fehler ist beim Upload aufgetreten.", 500
 
     res = supabase.storage.from_(BUCKET_NAME).list()
     existing_libraries = [item['name'] for item in res if item['id'] is not None]
@@ -138,7 +155,7 @@ def evaluate_answer():
         retriever = vectorstore.as_retriever(search_kwargs={'k': 3})
         relevant_docs = retriever.get_relevant_documents(question + " " + participant_answer)
         context_from_docs = "\n\n".join([doc.page_content for doc in relevant_docs])
-        evaluation_template = """Bewerte als strenger Prüfer... Bewertung und Begründung:"""
+        evaluation_template = """Bewerte als strenger Prüfer die "Antwort des Teilnehmers" auf die "Frage"..."""
         prompt = PromptTemplate.from_template(evaluation_template)
         chain = prompt | llm
         evaluation_result = chain.invoke({"context": context_from_docs, "question": question, "answer": participant_answer}).content
