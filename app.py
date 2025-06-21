@@ -1,4 +1,4 @@
-# WISSENS-APP PRO - VERSION 3.2 (FINAL)
+# WISSENS-APP PRO - VERSION 3.3 (FINALER BUGFIX)
 import os
 import uuid
 import shutil
@@ -34,24 +34,18 @@ except Exception as e:
 # --- Hilfsfunktionen ---
 def load_vector_store_from_supabase(library_id):
     try:
-        # Pfade definieren
         supabase_path_pkl = f"{library_id}/faiss_index.pkl"
         supabase_path_faiss = f"{library_id}/faiss_index.faiss"
         local_temp_path = f"temp_index_{library_id}"
         
-        # Index-Dateien von Supabase herunterladen und temporär speichern
         with open(f"{local_temp_path}.pkl", 'wb+') as f:
             f.write(supabase.storage.from_(BUCKET_NAME).download(path=supabase_path_pkl))
         with open(f"{local_temp_path}.faiss", 'wb+') as f:
             f.write(supabase.storage.from_(BUCKET_NAME).download(path=supabase_path_faiss))
 
-        # Index von der lokalen temporären Datei laden
         vectorstore = FAISS.load_local(local_temp_path, embeddings, allow_dangerous_deserialization=True)
-        
-        # Temporäre Dateien sofort wieder aufräumen
         os.remove(f"{local_temp_path}.pkl")
         os.remove(f"{local_temp_path}.faiss")
-        
         return vectorstore
     except Exception as e:
         print(f"Fehler beim Laden des Index für {library_id}: {e}")
@@ -64,25 +58,20 @@ def admin_page():
         try:
             files = request.files.getlist('files')
             if not files or files[0].filename == '': return "Keine Dateien ausgewählt", 400
-            
             library_id = str(uuid.uuid4())
-            print(f"Erstelle neue Bibliothek mit ID: {library_id}")
 
             docs = []
             for file in files:
                 filename = file.filename
                 pdf_bytes = file.read()
                 
-                # Lade PDF-Datei nach Supabase hoch
-                print(f"--> Lade '{filename}' nach Supabase hoch...")
-                # KORREKTUR: Wir übergeben die `pdf_bytes`, nicht das `file`-Objekt.
+                # HIER WAR DER FEHLER: Wir müssen die Bytes übergeben, nicht das File-Objekt
                 supabase.storage.from_(BUCKET_NAME).upload(
                     path=f"{library_id}/{filename}",
                     file=pdf_bytes,
                     file_options={"content-type": "application/pdf"}
                 )
 
-                # Verarbeite die PDF für LangChain
                 temp_file_path = f"temp_{filename}"
                 with open(temp_file_path, 'wb') as f:
                     f.write(pdf_bytes)
@@ -90,24 +79,21 @@ def admin_page():
                 docs.extend(loader.load())
                 os.remove(temp_file_path)
 
-            print("--> Erstelle Vektor-Datenbank...")
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
             split_docs = text_splitter.split_documents(docs)
             vectorstore = FAISS.from_documents(split_docs, embeddings)
             
-            # Speichere Index temporär lokal, um ihn dann hochzuladen
             temp_index_path = f"temp_index_{library_id}"
             vectorstore.save_local(temp_index_path)
 
-            print("--> Lade Index nach Supabase hoch...")
-            with open(f"{temp_index_path}.pkl", 'rb') as f:
-                supabase.storage.from_(BUCKET_NAME).upload(file=f, path=f"{library_id}/faiss_index.pkl")
-            with open(f"{temp_index_path}.faiss", 'rb') as f:
-                supabase.storage.from_(BUCKET_NAME).upload(file=f, path=f"{library_id}/faiss_index.faiss")
+            # AUCH HIER SICHERHEITSHALBER DIE BYTES LESEN UND ÜBERGEBEN
+            with open(f"{temp_index_path}.pkl", 'rb') as f_pkl:
+                supabase.storage.from_(BUCKET_NAME).upload(file=f_pkl.read(), path=f"{library_id}/faiss_index.pkl")
+            with open(f"{temp_index_path}.faiss", 'rb') as f_faiss:
+                supabase.storage.from_(BUCKET_NAME).upload(file=f_faiss.read(), path=f"{library_id}/faiss_index.faiss")
             
             os.remove(f"{temp_index_path}.pkl")
             os.remove(f"{temp_index_path}.faiss")
-            print(f"--> Bibliothek '{library_id}' erfolgreich erstellt.")
             
             return redirect(url_for('creation_success', library_id=library_id))
         except Exception as e:
@@ -136,7 +122,7 @@ def ask_question():
         if not vectorstore.docstore._dict: return jsonify({"error": "Diese Bibliothek enthält keine Dokumente."}), 500
         random_doc_index = random.choice(list(vectorstore.docstore._dict.keys()))
         context_text = vectorstore.docstore._dict[random_doc_index].page_content
-        prompt_template = "Du bist ein Lehrer. Erstelle eine prägnante Frage zum folgenden Textabschnitt... Frage:"
+        prompt_template = "Du bist ein Lehrer. Erstelle eine prägnante Frage zum folgenden Textabschnitt..."
         prompt = PromptTemplate.from_template(prompt_template)
         chain = prompt | llm
         question = chain.invoke({"context": context_text}).content
@@ -155,7 +141,7 @@ def evaluate_answer():
         retriever = vectorstore.as_retriever(search_kwargs={'k': 3})
         relevant_docs = retriever.get_relevant_documents(question + " " + participant_answer)
         context_from_docs = "\n\n".join([doc.page_content for doc in relevant_docs])
-        evaluation_template = """Bewerte als strenger Prüfer die "Antwort des Teilnehmers" auf die "Frage"..."""
+        evaluation_template = """Bewerte als strenger Prüfer die "Antwort des Teilnehmers"..."""
         prompt = PromptTemplate.from_template(evaluation_template)
         chain = prompt | llm
         evaluation_result = chain.invoke({"context": context_from_docs, "question": question, "answer": participant_answer}).content
@@ -190,50 +176,8 @@ LERNER_HTML = """
     const libraryId = '{{ library_id }}';
     const getQuestionBtn = document.getElementById('get-question-btn');
     const submitAnswerBtn = document.getElementById('submit-answer-btn');
-    const qaArea = document.getElementById('qa-area');
-    const questionEl = document.getElementById('question');
-    const answerEl = document.getElementById('answer');
-    const evaluationEl = document.getElementById('evaluation');
-    async function getQuestion() {
-        getQuestionBtn.disabled = true;
-        getQuestionBtn.textContent = 'Generiere Frage...';
-        const response = await fetch('/ask', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ library_id: libraryId })});
-        const data = await response.json();
-        if (response.ok) {
-            questionEl.textContent = data.question;
-            qaArea.style.display = 'block';
-            evaluationEl.style.display = 'none';
-            getQuestionBtn.style.display = 'none';
-        } else {
-            alert('Fehler beim Fragen holen: ' + data.error);
-            getQuestionBtn.disabled = false;
-            getQuestionBtn.textContent = 'Neue Frage anfordern';
-        }
-    }
-    async function evaluateAnswer() {
-        const question = questionEl.textContent;
-        const answer = answerEl.value;
-        if (!answer.trim()) { alert('Bitte geben Sie eine Antwort ein.'); return; }
-        submitAnswerBtn.disabled = true;
-        submitAnswerBtn.textContent = 'Bewerte...';
-        const response = await fetch('/evaluate', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ library_id: libraryId, question: question, answer: answer })});
-        const data = await response.json();
-        submitAnswerBtn.disabled = false;
-        submitAnswerBtn.textContent = 'Antwort abschicken';
-        if (response.ok) {
-            evaluationEl.innerText = data.evaluation;
-            evaluationEl.style.display = 'block';
-            qaArea.style.display = 'none';
-            getQuestionBtn.style.display = 'block';
-            getQuestionBtn.disabled = false;
-            getQuestionBtn.textContent = 'Nächste Frage anfordern';
-            answerEl.value = '';
-        } else {
-            alert('Fehler bei der Bewertung: ' + data.error);
-        }
-    }
-    getQuestionBtn.addEventListener('click', getQuestion);
-    submitAnswerBtn.addEventListener('click', evaluateAnswer);
+    // ... restlicher JavaScript-Code bleibt identisch ...
+    async function getQuestion(){getQuestionBtn.disabled=!0,getQuestionBtn.textContent='Generiere Frage...';const e=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({library_id:libraryId})}),t=await e.json();e.ok?(document.getElementById('question').textContent=t.question,document.getElementById('qa-area').style.display='block',document.getElementById('evaluation').style.display='none',getQuestionBtn.style.display='none'):(alert('Fehler beim Fragen holen: '+t.error),getQuestionBtn.disabled=!1,getQuestionBtn.textContent='Neue Frage anfordern')}async function evaluateAnswer(){const e=document.getElementById('question').textContent,t=document.getElementById('answer').value;if(!t.trim())return void alert('Bitte geben Sie eine Antwort ein.');submitAnswerBtn.disabled=!0,submitAnswerBtn.textContent='Bewerte...';const n=await fetch('/evaluate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({library_id:libraryId,question:e,answer:t})}),s=await n.json();submitAnswerBtn.disabled=!1,submitAnswerBtn.textContent='Antwort abschicken',n.ok?(document.getElementById('evaluation').innerText=s.evaluation,document.getElementById('evaluation').style.display='block',document.getElementById('qa-area').style.display='none',document.getElementById('get-question-btn').style.display='block',getQuestionBtn.disabled=!1,getQuestionBtn.textContent='Nächste Frage anfordern',document.getElementById('answer').value=''):alert('Fehler bei der Bewertung: '+s.error)}getQuestionBtn.addEventListener('click',getQuestion),submitAnswerBtn.addEventListener('click',evaluateAnswer);
 </script>
 </body></html>
 """
